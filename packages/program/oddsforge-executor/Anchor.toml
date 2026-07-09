@@ -1,11 +1,12 @@
 [toolchain]
 package_manager = "yarn"
+solana_version = "4.0.0"
 
 [features]
 resolution = true
 skip-lint = false
 
-[programs.localnet]
+[programs.devnet]
 oddsforge_executor = "7NeF1c8RMvLzM7qDgcroJ3PmmTbQpWCCaAw2dWHYfAwL"
 
 [registry]

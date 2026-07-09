@@ -145,7 +145,10 @@ export class TxLineAuth {
     anchor.setProvider(this.provider);
 
     // Use the program ID from the selected network, regardless of IDL address field
-    this.program = new anchor.Program(TXORACLE_IDL, this.netCfg.programId, this.provider);
+    // Anchor 0.31 reads the program ID from idl.address — inject the
+    // network-specific address so devnet/mainnet both work correctly.
+    const idlWithAddress = { ...TXORACLE_IDL, address: this.netCfg.programId.toBase58() } as anchor.Idl;
+    this.program = new anchor.Program(idlWithAddress, this.provider);
   }
 
   // ── public API ─────────────────────────────────────────────────────────────

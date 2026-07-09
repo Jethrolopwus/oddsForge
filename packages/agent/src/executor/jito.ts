@@ -44,6 +44,11 @@ export interface JitoBundleConfig {
    * Minimum is ~1000 lamports; 100_000 (0.0001 SOL) gives competitive priority.
    */
   tipLamports?: number;
+  /**
+   * When false the executor skips Jito entirely and submits via plain
+   * sendAndConfirmTransaction.  Defaults to true when blockEngineUrl is set.
+   */
+  enabled?: boolean;
 }
 
 export interface BundleResult {
@@ -85,6 +90,7 @@ export class JitoExecutor {
   constructor(config: JitoBundleConfig) {
     this.cfg = {
       tipLamports: 100_000, // 0.0001 SOL default tip
+      enabled: true,
       ...config,
     };
   }
@@ -92,17 +98,23 @@ export class JitoExecutor {
   // ── public API ─────────────────────────────────────────────────────────────
 
   /**
-   * Execute a trade decision as a Jito bundle.
+   * Execute a trade decision.
    *
-   * 1. Builds the place_stake instruction via AnchorExecutor.
-   * 2. Adds a tip instruction to a random Jito tip account.
-   * 3. Signs and submits the bundle.
-   * 4. Returns bundle result with status.
+   * When Jito is enabled:
+   *  1. Builds place_stake + tip instruction as a bundle and submits to Jito.
+   *
+   * When Jito is disabled (no block engine configured):
+   *  1. Builds only the place_stake instruction.
+   *  2. Submits via plain sendAndConfirmTransaction on the RPC connection.
    */
   async executeDecision(
     decision: TradeDecision,
     anchorExecutor: AnchorExecutor
   ): Promise<BundleResult> {
+    if (!this.cfg.enabled) {
+      return this._executeViaRpc(decision, anchorExecutor);
+    }
+
     // Build the payload instruction
     const stakeIx = await anchorExecutor.buildPlaceStakeInstruction(decision);
 
@@ -122,6 +134,35 @@ export class JitoExecutor {
     const bundleResult = await this._submitBundle([tx], [signature]);
 
     return bundleResult;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Plain RPC fallback (no Jito)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  private async _executeViaRpc(
+    decision: TradeDecision,
+    anchorExecutor: AnchorExecutor
+  ): Promise<BundleResult> {
+    console.log("[Jito] Disabled — submitting via plain RPC");
+
+    const stakeIx = await anchorExecutor.buildPlaceStakeInstruction(decision);
+    const tx = await this._buildTransaction([stakeIx]);
+    tx.sign(this.cfg.wallet);
+
+    const signature = await sendAndConfirmTransaction(
+      this.cfg.connection,
+      tx,
+      [this.cfg.wallet],
+      { commitment: "confirmed" }
+    );
+
+    console.log(`[RPC] Transaction confirmed | sig=${signature}`);
+    return {
+      bundleId: signature,
+      signatures: [signature],
+      status: "finalized",
+    };
   }
 
   /**

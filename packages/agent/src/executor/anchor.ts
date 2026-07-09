@@ -53,16 +53,22 @@ export interface AnchorExecutorConfig {
 // Keep in sync with lib.rs.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Anchor 0.31 IDL format:
+//  - instructions use { name, discriminator, accounts, args }
+//  - accounts array contains only { name, discriminator } — no embedded type
+//  - full type definitions live in types[]
+//  - discriminators are the first 8 bytes of sha256("global:<snake_case_name>")
 const IDL = {
-  version: "0.1.0",
-  name: "oddsforge_executor",
+  address: "", // injected at runtime from config.programId
+  metadata: { name: "oddsforge_executor", version: "0.1.0", spec: "0.1.0" },
   instructions: [
     {
       name: "placeStake",
+      discriminator: [133, 210, 132, 56, 35, 234, 87, 234],
       accounts: [
-        { name: "authority", isMut: true, isSigner: true },
-        { name: "position", isMut: true, isSigner: false },
-        { name: "systemProgram", isMut: false, isSigner: false },
+        { name: "authority", writable: true, signer: true },
+        { name: "position", writable: true },
+        { name: "systemProgram" },
       ],
       args: [
         { name: "matchId", type: "string" },
@@ -74,53 +80,61 @@ const IDL = {
     },
     {
       name: "settlePosition",
+      discriminator: [212, 28, 11, 164, 253, 189, 72, 155],
       accounts: [
-        { name: "authority", isMut: true, isSigner: true },
-        { name: "position", isMut: true, isSigner: false },
+        { name: "authority", writable: true, signer: true },
+        { name: "position", writable: true },
       ],
       args: [{ name: "outcome", type: "string" }],
     },
     {
       name: "closePosition",
+      discriminator: [123, 134, 59, 85, 229, 41, 210, 47],
       accounts: [
-        { name: "authority", isMut: true, isSigner: true },
-        { name: "position", isMut: true, isSigner: false },
+        { name: "authority", writable: true, signer: true },
+        { name: "position", writable: true },
       ],
       args: [],
     },
   ],
+  // In Anchor 0.31, accounts[] only holds name + discriminator.
+  // The actual struct layout is declared in types[].
   accounts: [
+    {
+      name: "Position",
+      discriminator: [170, 188, 143, 228, 122, 64, 247, 208],
+    },
+  ],
+  errors: [
+    { code: 6000, name: "SignalScoreTooLow", msg: "Signal score is below the minimum threshold of 60" },
+    { code: 6001, name: "InvalidMatchId",    msg: "match_id is empty or exceeds 64 bytes" },
+    { code: 6002, name: "InvalidSelection",  msg: "selection is empty or exceeds 32 bytes" },
+    { code: 6003, name: "InvalidOdds",       msg: "odds_snapshot must be greater than 1.0" },
+    { code: 6004, name: "InvalidStake",      msg: "stake_lamports must be greater than 0" },
+    { code: 6005, name: "AlreadySettled",    msg: "Position has already been settled" },
+    { code: 6006, name: "InvalidOutcome",    msg: "outcome must be 'won', 'lost', or 'voided'" },
+    { code: 6007, name: "Unauthorized",      msg: "Signer is not the position authority" },
+    { code: 6008, name: "PositionStillOpen", msg: "Cannot close an open position — settle it first" },
+  ],
+  types: [
     {
       name: "Position",
       type: {
         kind: "struct",
         fields: [
-          { name: "authority", type: "publicKey" },
+          { name: "authority", type: "pubkey" },
           { name: "matchId", type: "string" },
           { name: "selection", type: "string" },
           { name: "oddsSnapshot", type: "u64" },
           { name: "stakeLamports", type: "u64" },
           { name: "signalScore", type: "u8" },
-          { name: "status", type: { defined: "PositionStatus" } },
+          { name: "status", type: { defined: { name: "PositionStatus" } } },
           { name: "placedAt", type: "i64" },
           { name: "settledAt", type: "i64" },
           { name: "bump", type: "u8" },
         ],
       },
     },
-  ],
-  errors: [
-    { code: 6000, name: "SignalScoreTooLow", msg: "Signal score is below the minimum threshold of 60" },
-    { code: 6001, name: "InvalidMatchId",   msg: "match_id is empty or exceeds 64 bytes" },
-    { code: 6002, name: "InvalidSelection", msg: "selection is empty or exceeds 32 bytes" },
-    { code: 6003, name: "InvalidOdds",      msg: "odds_snapshot must be greater than 1.0" },
-    { code: 6004, name: "InvalidStake",     msg: "stake_lamports must be greater than 0" },
-    { code: 6005, name: "AlreadySettled",   msg: "Position has already been settled" },
-    { code: 6006, name: "InvalidOutcome",   msg: "outcome must be 'won', 'lost', or 'voided'" },
-    { code: 6007, name: "Unauthorized",     msg: "Signer is not the position authority" },
-    { code: 6008, name: "PositionStillOpen",msg: "Cannot close an open position — settle it first" },
-  ],
-  types: [
     {
       name: "PositionStatus",
       type: {
@@ -157,7 +171,10 @@ export class AnchorExecutor {
       preflightCommitment: "confirmed",
     });
 
-    this.program = new anchor.Program(IDL, config.programId, this.provider);
+    // Anchor 0.31 reads the program ID exclusively from idl.address —
+    // inject it at runtime so we don't hard-code it in the IDL constant.
+    const idlWithAddress = { ...IDL, address: config.programId.toBase58() } as anchor.Idl;
+    this.program = new anchor.Program(idlWithAddress, this.provider);
   }
 
   // ── public API ─────────────────────────────────────────────────────────────

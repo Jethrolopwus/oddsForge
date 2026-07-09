@@ -23,6 +23,7 @@ import Client, {
   SubscribeRequest,
   SubscribeUpdate,
 } from "@triton-one/yellowstone-grpc";
+import bs58 from "bs58";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -180,11 +181,12 @@ export class GeyserListener extends EventEmitter {
     if (!stream) return;
 
     // Build account filter map: one entry per watched pubkey
-    const accountsFilter: Record<string, { account: string[]; filters: unknown[] }> = {};
+    const accountsFilter: SubscribeRequest["accounts"] = {};
 
     for (const pubkey of this.watchList) {
       accountsFilter[pubkey] = {
         account: [pubkey],
+        owner: [],
         filters: [],
       };
     }
@@ -219,15 +221,18 @@ export class GeyserListener extends EventEmitter {
     if (!pubkey || !accountInfo) return;
 
     // Convert pubkey bytes to base58
-    const pubkeyBase58 = Buffer.from(pubkey).toString("base58");
+    const pubkeyBase58 = bs58.encode(Buffer.from(pubkey));
+
+    // lamports is a string in this version of the gRPC types
+    const lamportsNum = Number(accountInfo.lamports ?? 0);
 
     const accountUpdate: AccountUpdate = {
       pubkey: pubkeyBase58,
       data: Buffer.from(accountInfo.data ?? []),
-      lamports: BigInt(accountInfo.lamports ?? 0),
-      exists: (accountInfo.lamports ?? 0) > 0,
+      lamports: BigInt(lamportsNum),
+      exists: lamportsNum > 0,
       slot: BigInt(update.account.slot ?? 0),
-      seq: BigInt(update.account.seq ?? 0),
+      seq: 0n, // seq field not present in @triton-one/yellowstone-grpc@1.0.0
     };
 
     this.emit("account", accountUpdate);
@@ -244,5 +249,39 @@ export class GeyserListener extends EventEmitter {
       this._reconnectTimer = null;
       await this.connect();
     }, delayMs);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NoopGeyserListener — used when GEYSER_ENDPOINT is not configured.
+// Satisfies the same interface as GeyserListener so the rest of the agent
+// code doesn't need to branch everywhere.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export class NoopGeyserListener extends EventEmitter {
+  async connect(): Promise<void> {
+    console.log("[Geyser] Disabled — no endpoint configured. Skipping gRPC stream.");
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  watchAccount(_pubkey: string): void { /* no-op */ }
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  unwatchAccount(_pubkey: string): void { /* no-op */ }
+
+  stop(): void { /* no-op */ }
+
+  on<K extends keyof GeyserListenerEvents>(
+    event: K,
+    listener: GeyserListenerEvents[K]
+  ): this {
+    return super.on(event, listener as (...args: unknown[]) => void);
+  }
+
+  emit<K extends keyof GeyserListenerEvents>(
+    event: K,
+    ...args: Parameters<GeyserListenerEvents[K]>
+  ): boolean {
+    return super.emit(event, ...args);
   }
 }

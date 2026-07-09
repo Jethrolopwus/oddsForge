@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+packages/agent/node_modules/
+
+# Build output
+dist/
+packages/agent/dist/
+
+# Environment
+.env
+packages/agent/.env
+
+# Locks (optional - some teams commit these)
+package-lock.json
+packages/agent/package-lock.json
+
+# Rust/Anchor
+target/
+packages/program/oddsforge-executor/target/
+
+# Misc
+tsc
+*.js.map
+*.d.ts.map

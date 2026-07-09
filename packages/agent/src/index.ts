@@ -35,7 +35,7 @@ import bs58 from "bs58";
 
 import { TxLineAuth, TxLineCredentials, REFRESH_INTERVAL_MS } from "./feeds/txline-auth";
 import { TxLineConnector, OddsEvent } from "./feeds/txline";
-import { GeyserListener, AccountUpdate } from "./feeds/geyser";
+import { GeyserListener, NoopGeyserListener, AccountUpdate } from "./feeds/geyser";
 import { SignalEngine, Signal } from "./engine/signal";
 import { StrategyEngine, TradeDecision } from "./engine/strategy";
 import { AnchorExecutor } from "./executor/anchor";
@@ -49,9 +49,6 @@ function loadConfig() {
   const required = [
     "SOLANA_RPC_URL",
     "SOLANA_PRIVATE_KEY",
-    "GEYSER_ENDPOINT",
-    "GEYSER_TOKEN",
-    "JITO_BLOCK_ENGINE_URL",
     "PROGRAM_ID",
   ] as const;
 
@@ -61,6 +58,20 @@ function loadConfig() {
       `Missing required environment variables: ${missing.join(", ")}\nSee .env.example for reference.`
     );
   }
+
+  // Geyser is optional — disabled when endpoint is absent or still a placeholder
+  const geyserEndpoint = process.env.GEYSER_ENDPOINT ?? "";
+  const geyserToken = process.env.GEYSER_TOKEN ?? "";
+  const geyserEnabled =
+    geyserEndpoint.length > 0 &&
+    !geyserEndpoint.includes("your-endpoint") &&
+    geyserToken.length > 0 &&
+    !geyserToken.includes("your-triton");
+
+  // Jito is optional — disabled when URL is absent or still a placeholder
+  const jitoUrl = process.env.JITO_BLOCK_ENGINE_URL ?? "";
+  const jitoEnabled =
+    jitoUrl.length > 0 && !jitoUrl.includes("your-jito");
 
   // Parse wallet — accepts either a JSON byte-array or base58 private key
   const rawKey = process.env.SOLANA_PRIVATE_KEY!;
@@ -76,16 +87,22 @@ function loadConfig() {
     throw new Error(`TXLINE_NETWORK must be "mainnet" or "devnet", got "${network}"`);
   }
 
+  // TxLINE service level defaults:
+  //   devnet  → 1  (60s delay — the only free level supported on devnet)
+  //   mainnet → 12 (real-time World Cup free tier)
+  const defaultServiceLevel = network === "devnet" ? "1" : "12";
+
   return {
     rpcUrl: process.env.SOLANA_RPC_URL!,
     wallet,
     network,
-    // TxLINE service level: 12 = real-time World Cup (free); 1 = 60s delay (free)
-    serviceLevelId: parseInt(process.env.TXLINE_SERVICE_LEVEL_ID ?? "12", 10),
+    serviceLevelId: parseInt(process.env.TXLINE_SERVICE_LEVEL_ID ?? defaultServiceLevel, 10),
     durationWeeks: parseInt(process.env.TXLINE_DURATION_WEEKS ?? "4", 10),
-    geyserEndpoint: process.env.GEYSER_ENDPOINT!,
-    geyserToken: process.env.GEYSER_TOKEN!,
-    jitoBlockEngineUrl: process.env.JITO_BLOCK_ENGINE_URL!,
+    geyserEndpoint,
+    geyserToken,
+    geyserEnabled,
+    jitoBlockEngineUrl: jitoUrl,
+    jitoEnabled,
     programId: new PublicKey(process.env.PROGRAM_ID!),
     tipLamports: parseInt(process.env.JITO_TIP_LAMPORTS ?? "100000", 10),
     minScore: parseInt(process.env.MIN_SIGNAL_SCORE ?? "60", 10),
@@ -105,7 +122,7 @@ class OddsForgeAgent {
   private readonly strategy: StrategyEngine;
   private readonly anchor: AnchorExecutor;
   private readonly jito: JitoExecutor;
-  private readonly geyser: GeyserListener;
+  private readonly geyser: GeyserListener | NoopGeyserListener;
 
   // Live credentials — updated on every refresh
   private credentials: TxLineCredentials | null = null;
@@ -152,12 +169,15 @@ class OddsForgeAgent {
       wallet: cfg.wallet,
       connection: this.anchor.connection,
       tipLamports: cfg.tipLamports,
+      enabled: cfg.jitoEnabled,
     });
 
-    this.geyser = new GeyserListener({
-      endpoint: cfg.geyserEndpoint,
-      token: cfg.geyserToken,
-    });
+    this.geyser = cfg.geyserEnabled
+      ? new GeyserListener({
+          endpoint: cfg.geyserEndpoint,
+          token: cfg.geyserToken,
+        })
+      : new NoopGeyserListener();
   }
 
   // ── lifecycle ──────────────────────────────────────────────────────────────
@@ -171,7 +191,9 @@ class OddsForgeAgent {
     console.log(`  Program  : ${this.cfg.programId.toBase58()}`);
     console.log(`  Network  : ${this.cfg.network}`);
     console.log(`  RPC      : ${this.cfg.rpcUrl}`);
-    console.log(`  SvcLevel : ${this.cfg.serviceLevelId} (${this.cfg.serviceLevelId === 12 ? "real-time" : "60s delay"})`);
+    console.log(`  SvcLevel : ${this.cfg.serviceLevelId} (${this.cfg.serviceLevelId === 12 ? "real-time" : "60s delay (devnet))"})`);
+    console.log(`  Geyser   : ${this.cfg.geyserEnabled ? "enabled" : "disabled (no endpoint)"}`);
+    console.log(`  Jito     : ${this.cfg.jitoEnabled ? "enabled" : "disabled (plain RPC fallback)"}`);  
     console.log("═══════════════════════════════════════════════════════════\n");
 
     // Step 1 — Bootstrap TxLINE auth (on-chain subscribe + API token)
