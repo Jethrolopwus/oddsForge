@@ -1,32 +1,34 @@
 /**
  * index.ts — OddsForge Autonomous Agent
  *
- * Main entry point.  Wires together:
- *
- *   TxLineAuth         → bootstrap on-chain subscription + API token
- *   TxLineConnector    → SSE stream of live odds (real TxLINE schema)
- *   SignalEngine       → detects ≥5% odds movements, scores 0–100
- *   StrategyEngine     → gates, deduplicates, and sizes positions
- *   JitoExecutor       → bundles + submits Jito transactions
- *   AnchorExecutor     → calls place_stake / settle_position / close_position
- *   GeyserListener     → watches Position PDAs for on-chain confirmation
+ * Wires together:
+ *   TxLineAuth              → bootstrap on-chain subscription + API token
+ *   TxLineConnector         → SSE stream of live odds
+ *   TxLineScoresConnector   → SSE stream of live scores
+ *   SignalEngine            → detects ≥5% odds movements, scores 0–100
+ *   StrategyEngine          → gates, deduplicates, and sizes positions
+ *   JitoExecutor            → bundles + submits transactions (optional)
+ *   AnchorExecutor          → calls place_stake / settle_position / close_position
+ *   GeyserListener          → watches Position PDAs for on-chain confirmation (optional)
  *
  * Startup sequence:
  *  1. Load config from .env
  *  2. Bootstrap TxLINE auth (subscribe on-chain + activate API token)
- *  3. Connect Geyser listener
- *  4. Connect TxLINE SSE stream
- *  5. Schedule periodic token refresh, history prune, and settlement check
+ *  3. Connect Geyser listener (skipped when GEYSER_ENDPOINT is blank)
+ *  4. Connect TxLINE odds SSE stream
+ *  5. Connect TxLINE scores SSE stream
+ *  6. Schedule periodic token refresh, history prune, and settlement check
  *
- * Environment variables (see .env.example):
- *   SOLANA_RPC_URL, SOLANA_PRIVATE_KEY, TXLINE_NETWORK,
- *   GEYSER_ENDPOINT, GEYSER_TOKEN,
- *   JITO_BLOCK_ENGINE_URL, PROGRAM_ID
+ * Settlement:
+ *  - Live settle: scores stream emits game_finalised (statusId=100).
+ *    The agent resolves the outcome from the final score and calls
+ *    settle_position immediately.
+ *  - Fallback: if a fixture hasn't produced odds for 2 hours the agent
+ *    settles the position as "voided".
  *
- * Optional tuning:
- *   TXLINE_SERVICE_LEVEL_ID, TXLINE_DURATION_WEEKS,
- *   JITO_TIP_LAMPORTS, MIN_SIGNAL_SCORE,
- *   MIN_STAKE_LAMPORTS, MAX_STAKE_LAMPORTS
+ * Geyser / Jito are fully optional:
+ *  - Leave GEYSER_ENDPOINT blank → NoopGeyserListener is used (no-op).
+ *  - Leave JITO_BLOCK_ENGINE_URL blank → plain RPC submission is used.
  */
 
 import "dotenv/config";
@@ -35,6 +37,7 @@ import bs58 from "bs58";
 
 import { TxLineAuth, TxLineCredentials, REFRESH_INTERVAL_MS } from "./feeds/txline-auth";
 import { TxLineConnector, OddsEvent } from "./feeds/txline";
+import { TxLineScoresConnector, ScoreEvent } from "./feeds/txline-scores";
 import { GeyserListener, NoopGeyserListener, AccountUpdate } from "./feeds/geyser";
 import { SignalEngine, Signal } from "./engine/signal";
 import { StrategyEngine, TradeDecision } from "./engine/strategy";
@@ -42,38 +45,32 @@ import { AnchorExecutor } from "./executor/anchor";
 import { JitoExecutor } from "./executor/jito";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Config — loaded from environment
+// Config
 // ─────────────────────────────────────────────────────────────────────────────
 
 function loadConfig() {
-  const required = [
-    "SOLANA_RPC_URL",
-    "SOLANA_PRIVATE_KEY",
-    "PROGRAM_ID",
-  ] as const;
-
-  const missing = required.filter((k) => !process.env[k]);
+  const required = ["SOLANA_RPC_URL", "SOLANA_PRIVATE_KEY", "PROGRAM_ID"] as const;
+  const missing  = required.filter((k) => !process.env[k]);
   if (missing.length > 0) {
     throw new Error(
       `Missing required environment variables: ${missing.join(", ")}\nSee .env.example for reference.`
     );
   }
 
-  // Geyser is optional — disabled when endpoint is absent or still a placeholder
+  // Geyser is optional — disabled when endpoint is absent or a placeholder
   const geyserEndpoint = process.env.GEYSER_ENDPOINT ?? "";
-  const geyserToken = process.env.GEYSER_TOKEN ?? "";
-  const geyserEnabled =
+  const geyserToken    = process.env.GEYSER_TOKEN ?? "";
+  const geyserEnabled  =
     geyserEndpoint.length > 0 &&
     !geyserEndpoint.includes("your-endpoint") &&
     geyserToken.length > 0 &&
     !geyserToken.includes("your-triton");
 
-  // Jito is optional — disabled when URL is absent or still a placeholder
-  const jitoUrl = process.env.JITO_BLOCK_ENGINE_URL ?? "";
-  const jitoEnabled =
-    jitoUrl.length > 0 && !jitoUrl.includes("your-jito");
+  // Jito is optional — disabled when URL is absent or a placeholder
+  const jitoUrl     = process.env.JITO_BLOCK_ENGINE_URL ?? "";
+  const jitoEnabled = jitoUrl.length > 0 && !jitoUrl.includes("your-jito");
 
-  // Parse wallet — accepts either a JSON byte-array or base58 private key
+  // Parse wallet — accepts JSON byte-array or base58 private key
   const rawKey = process.env.SOLANA_PRIVATE_KEY!;
   let wallet: Keypair;
   try {
@@ -87,27 +84,40 @@ function loadConfig() {
     throw new Error(`TXLINE_NETWORK must be "mainnet" or "devnet", got "${network}"`);
   }
 
-  // TxLINE service level defaults:
-  //   devnet  → 1  (60s delay — the only free level supported on devnet)
-  //   mainnet → 12 (real-time World Cup free tier)
+  const rpcUrl = process.env.SOLANA_RPC_URL!;
+  const rpcLooksDevnet = /devnet/i.test(rpcUrl);
+  const rpcLooksMainnet = /mainnet/i.test(rpcUrl);
+  if (network === "devnet" && rpcLooksMainnet) {
+    throw new Error(
+      "TXLINE_NETWORK=devnet but SOLANA_RPC_URL points at mainnet. " +
+      "Use https://api.devnet.solana.com for devnet testing."
+    );
+  }
+  if (network === "mainnet" && rpcLooksDevnet) {
+    throw new Error(
+      "TXLINE_NETWORK=mainnet but SOLANA_RPC_URL points at devnet. " +
+      "Use a mainnet RPC endpoint for production."
+    );
+  }
+
   const defaultServiceLevel = network === "devnet" ? "1" : "12";
 
   return {
-    rpcUrl: process.env.SOLANA_RPC_URL!,
+    rpcUrl,
     wallet,
     network,
-    serviceLevelId: parseInt(process.env.TXLINE_SERVICE_LEVEL_ID ?? defaultServiceLevel, 10),
-    durationWeeks: parseInt(process.env.TXLINE_DURATION_WEEKS ?? "4", 10),
+    serviceLevelId:      parseInt(process.env.TXLINE_SERVICE_LEVEL_ID ?? defaultServiceLevel, 10),
+    durationWeeks:       parseInt(process.env.TXLINE_DURATION_WEEKS ?? "4", 10),
     geyserEndpoint,
     geyserToken,
     geyserEnabled,
-    jitoBlockEngineUrl: jitoUrl,
+    jitoBlockEngineUrl:  jitoUrl,
     jitoEnabled,
-    programId: new PublicKey(process.env.PROGRAM_ID!),
-    tipLamports: parseInt(process.env.JITO_TIP_LAMPORTS ?? "100000", 10),
-    minScore: parseInt(process.env.MIN_SIGNAL_SCORE ?? "60", 10),
-    minStakeLamports: parseInt(process.env.MIN_STAKE_LAMPORTS ?? "10000000", 10),
-    maxStakeLamports: parseInt(process.env.MAX_STAKE_LAMPORTS ?? "100000000", 10),
+    programId:           new PublicKey(process.env.PROGRAM_ID!),
+    tipLamports:         parseInt(process.env.JITO_TIP_LAMPORTS ?? "100000", 10),
+    minScore:            parseInt(process.env.MIN_SIGNAL_SCORE ?? "60", 10),
+    minStakeLamports:    parseInt(process.env.MIN_STAKE_LAMPORTS ?? "10000000", 10),
+    maxStakeLamports:    parseInt(process.env.MAX_STAKE_LAMPORTS ?? "100000000", 10),
   };
 }
 
@@ -116,67 +126,62 @@ function loadConfig() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class OddsForgeAgent {
-  // Components
-  private readonly auth: TxLineAuth;
-  private readonly signal: SignalEngine;
+  private readonly auth:     TxLineAuth;
+  private readonly signal:   SignalEngine;
   private readonly strategy: StrategyEngine;
-  private readonly anchor: AnchorExecutor;
-  private readonly jito: JitoExecutor;
-  private readonly geyser: GeyserListener | NoopGeyserListener;
+  private readonly anchor:   AnchorExecutor;
+  private readonly jito:     JitoExecutor;
+  private readonly geyser:   GeyserListener | NoopGeyserListener;
 
-  // Live credentials — updated on every refresh
   private credentials: TxLineCredentials | null = null;
+  private oddsFeed:   TxLineConnector | null = null;
+  private scoresFeed: TxLineScoresConnector | null = null;
 
-  // TxLINE SSE connector — created after auth
-  private feed: TxLineConnector | null = null;
-
-  // Last TxSig from on-chain subscription (used for token-only refresh)
-  private lastSubscriptionTxSig: string | null = null;
-
-  // Per-fixture last-seen timestamp (for settlement detection)
+  /** Per-fixture last-seen odds timestamp (for stale-match fallback settlement) */
   private readonly lastSeenTs: Map<string, number> = new Map();
 
-  // Timers
-  private pruneTimer?: ReturnType<typeof setInterval>;
-  private settlementTimer?: ReturnType<typeof setInterval>;
+  /**
+   * Per-fixture final score from game_finalised events.
+   * Key = fixtureId, value = { score1, score2 }.
+   */
+  private readonly finalScores: Map<string, { score1: number; score2: number }> = new Map();
+
+  private pruneTimer?:        ReturnType<typeof setInterval>;
+  private settlementTimer?:   ReturnType<typeof setInterval>;
   private tokenRefreshTimer?: ReturnType<typeof setTimeout>;
 
   constructor(private readonly cfg: ReturnType<typeof loadConfig>) {
     this.auth = new TxLineAuth({
-      network: cfg.network,
-      wallet: cfg.wallet,
+      network:        cfg.network,
+      wallet:         cfg.wallet,
       serviceLevelId: cfg.serviceLevelId,
-      durationWeeks: cfg.durationWeeks,
+      durationWeeks:  cfg.durationWeeks,
     });
 
-    this.signal = new SignalEngine();
-
+    this.signal   = new SignalEngine();
     this.strategy = new StrategyEngine({
-      minScore: cfg.minScore,
+      minScore:        cfg.minScore,
       minStakeLamports: cfg.minStakeLamports,
       maxStakeLamports: cfg.maxStakeLamports,
     });
 
     this.anchor = new AnchorExecutor({
-      rpcUrl: cfg.rpcUrl,
-      wallet: cfg.wallet,
+      rpcUrl:    cfg.rpcUrl,
+      wallet:    cfg.wallet,
       programId: cfg.programId,
       commitment: "confirmed",
     });
 
     this.jito = new JitoExecutor({
       blockEngineUrl: cfg.jitoBlockEngineUrl,
-      wallet: cfg.wallet,
-      connection: this.anchor.connection,
-      tipLamports: cfg.tipLamports,
-      enabled: cfg.jitoEnabled,
+      wallet:         cfg.wallet,
+      connection:     this.anchor.connection,
+      tipLamports:    cfg.tipLamports,
+      enabled:        cfg.jitoEnabled,
     });
 
     this.geyser = cfg.geyserEnabled
-      ? new GeyserListener({
-          endpoint: cfg.geyserEndpoint,
-          token: cfg.geyserToken,
-        })
+      ? new GeyserListener({ endpoint: cfg.geyserEndpoint, token: cfg.geyserToken })
       : new NoopGeyserListener();
   }
 
@@ -191,27 +196,24 @@ class OddsForgeAgent {
     console.log(`  Program  : ${this.cfg.programId.toBase58()}`);
     console.log(`  Network  : ${this.cfg.network}`);
     console.log(`  RPC      : ${this.cfg.rpcUrl}`);
-    console.log(`  SvcLevel : ${this.cfg.serviceLevelId} (${this.cfg.serviceLevelId === 12 ? "real-time" : "60s delay (devnet))"})`);
-    console.log(`  Geyser   : ${this.cfg.geyserEnabled ? "enabled" : "disabled (no endpoint)"}`);
-    console.log(`  Jito     : ${this.cfg.jitoEnabled ? "enabled" : "disabled (plain RPC fallback)"}`);  
+    console.log(`  SvcLevel : ${this.cfg.serviceLevelId} (${this.cfg.serviceLevelId === 12 ? "real-time" : "60s delay"})`);
+    console.log(`  Geyser   : ${this.cfg.geyserEnabled ? "enabled" : "disabled (no endpoint — set GEYSER_ENDPOINT to enable)"}`);
+    console.log(`  Jito     : ${this.cfg.jitoEnabled ? "enabled" : "disabled (plain RPC fallback — set JITO_BLOCK_ENGINE_URL to enable)"}`);
     console.log("═══════════════════════════════════════════════════════════\n");
 
-    // Step 1 — Bootstrap TxLINE auth (on-chain subscribe + API token)
     console.log("[Agent] Bootstrapping TxLINE auth …");
     this.credentials = await this.auth.activate();
-    // Record the subscription txSig for future token-only refreshes
-    // (activate() emits the txSig to the console; we re-activate on schedule)
     console.log("[Agent] TxLINE auth complete\n");
 
-    // Step 2 — Wire and connect Geyser
     this._wireGeyser();
     await this.geyser.connect();
 
-    // Step 3 — Create and wire the TxLINE SSE feed
-    this._createFeed();
-    this.feed!.connect();
+    this._createOddsFeed();
+    this.oddsFeed!.connect();
 
-    // Step 4 — Periodic maintenance
+    this._createScoresFeed();
+    this.scoresFeed!.connect();
+
     this._startPeriodicTasks();
 
     console.log("[Agent] All systems running — waiting for signals …\n");
@@ -219,73 +221,105 @@ class OddsForgeAgent {
 
   stop(): void {
     console.log("[Agent] Shutting down …");
-    this.feed?.stop();
+    this.oddsFeed?.stop();
+    this.scoresFeed?.stop();
     this.geyser.stop();
-    if (this.pruneTimer) clearInterval(this.pruneTimer);
+    if (this.pruneTimer)      clearInterval(this.pruneTimer);
     if (this.settlementTimer) clearInterval(this.settlementTimer);
     if (this.tokenRefreshTimer) clearTimeout(this.tokenRefreshTimer);
   }
 
-  // ── TxLINE feed setup ─────────────────────────────────────────────────────
+  // ── Odds feed ─────────────────────────────────────────────────────────────
 
-  private _createFeed(): void {
-    this.feed = new TxLineConnector(
+  private _createOddsFeed(): void {
+    this.oddsFeed = new TxLineConnector(
       this.auth.apiOrigin,
-      // Credentials are resolved lazily so refreshes take effect immediately
       () => {
-        if (!this.credentials) {
-          throw new Error("[Agent] TxLINE credentials not yet available");
-        }
-        return {
-          jwt: this.credentials.jwt,
-          apiToken: this.credentials.apiToken,
-        };
+        if (!this.credentials) throw new Error("[Agent] TxLINE credentials not yet available");
+        return { jwt: this.credentials.jwt, apiToken: this.credentials.apiToken };
       }
     );
 
-    this.feed.on("connected", () => {
-      console.log("[Agent] TxLINE SSE stream connected");
-    });
+    this.oddsFeed.on("connected",    () => console.log("[Agent] TxLINE odds stream connected"));
+    this.oddsFeed.on("disconnected", (r) => console.warn(`[Agent] Odds stream disconnected: ${r}`));
+    this.oddsFeed.on("error",        (e) => console.error(`[Agent] Odds error: ${e.message}`));
 
-    this.feed.on("disconnected", (reason) => {
-      console.warn(`[Agent] TxLINE stream disconnected: ${reason}`);
-    });
-
-    this.feed.on("error", (err) => {
-      console.error(`[Agent] TxLINE error: ${err.message}`);
-    });
-
-    this.feed.on("odds", (event: OddsEvent) => {
+    this.oddsFeed.on("odds", (event: OddsEvent) => {
       this.lastSeenTs.set(event.fixtureId, Date.now());
       this.signal.ingest(event);
     });
 
-    this.signal.on("signal", (sig: Signal) => {
-      this._onSignal(sig);
+    this.signal.on("signal", (sig: Signal) => this._onSignal(sig));
+  }
+
+  // ── Scores feed ───────────────────────────────────────────────────────────
+
+  private _createScoresFeed(): void {
+    this.scoresFeed = new TxLineScoresConnector(
+      this.auth.apiOrigin,
+      () => {
+        if (!this.credentials) throw new Error("[Agent] TxLINE credentials not yet available");
+        return { jwt: this.credentials.jwt, apiToken: this.credentials.apiToken };
+      }
+    );
+
+    this.scoresFeed.on("connected", () =>
+      console.log("[Agent] TxLINE scores stream connected")
+    );
+
+    this.scoresFeed.on("disconnected", (r) =>
+      console.warn(`[Agent] Scores stream disconnected: ${r}`)
+    );
+
+    this.scoresFeed.on("error", (e) =>
+      console.error(`[Agent] Scores error: ${e.message}`)
+    );
+
+    this.scoresFeed.on("score", (event: ScoreEvent) => {
+      const minute = event.minute != null ? `${event.minute}'` : "";
+      const score  = event.score1 != null && event.score2 != null
+        ? ` [${event.score1}–${event.score2}]`
+        : "";
+      const phase  = event.gamePhase ?? "";
+      console.log(
+        `[Scores] fixture=${event.fixtureId} action=${event.action}` +
+        ` ${phase}${minute}${score}`
+      );
+    });
+
+    // game_finalised (statusId=100) is the definitive match-end marker from
+    // the TxLINE docs — use it to drive real settle_position calls.
+    this.scoresFeed.on("game_finalised", (event: ScoreEvent) => {
+      console.log(
+        `[Scores] 🏁 game_finalised | fixture=${event.fixtureId}` +
+        ` score=${event.score1 ?? "?"}–${event.score2 ?? "?"}`
+      );
+
+      // Cache the final score for outcome resolution
+      if (event.score1 != null && event.score2 != null) {
+        this.finalScores.set(event.fixtureId, {
+          score1: event.score1,
+          score2: event.score2,
+        });
+      }
+
+      // Trigger live settlement for any open position on this fixture
+      this._settleFromScores(event.fixtureId).catch((err) =>
+        console.error(`[Agent] Live settlement error for fixture=${event.fixtureId}: ${String(err)}`)
+      );
     });
   }
 
   // ── Geyser wiring ─────────────────────────────────────────────────────────
 
   private _wireGeyser(): void {
-    this.geyser.on("connected", () => {
-      console.log("[Agent] Yellowstone Geyser connected");
-    });
-
-    this.geyser.on("error", (err) => {
-      console.error(`[Agent] Geyser error: ${err.message}`);
-    });
-
-    this.geyser.on("disconnected", () => {
-      console.warn("[Agent] Geyser disconnected — reconnecting …");
-    });
-
-    this.geyser.on("account", (update: AccountUpdate) => {
-      this._onAccountUpdate(update);
-    });
+    this.geyser.on("connected",    () => console.log("[Agent] Yellowstone Geyser connected"));
+    this.geyser.on("error",        (e) => console.error(`[Agent] Geyser error: ${e.message}`));
+    this.geyser.on("disconnected", () => console.warn("[Agent] Geyser disconnected — reconnecting …"));
+    this.geyser.on("account",      (u: AccountUpdate) => this._onAccountUpdate(u));
   }
 
-  // ── Signal → Decision → Execution pipeline ────────────────────────────────
+  // ── Signal → Decision → Execution ─────────────────────────────────────────
 
   private _onSignal(signal: Signal): void {
     const decision = this.strategy.evaluate(signal);
@@ -293,85 +327,114 @@ class OddsForgeAgent {
 
     console.log(
       `[Agent] ✦ Signal! fixture=${signal.fixtureId} sel=${signal.selectionName}` +
-        ` market=${signal.marketType} score=${signal.score}` +
-        ` odds=${signal.currentOdds.toFixed(4)}` +
-        ` ${signal.pctChange >= 0 ? "+" : ""}${(signal.pctChange * 100).toFixed(2)}%` +
-        ` ${signal.inRunning ? "[LIVE]" : "[pre]"}` +
-        ` stake=${(decision.stakeLamports / 1e9).toFixed(4)} SOL`
+      ` market=${signal.marketType} score=${signal.score}` +
+      ` odds=${signal.currentOdds.toFixed(4)}` +
+      ` ${signal.pctChange >= 0 ? "+" : ""}${(signal.pctChange * 100).toFixed(2)}%` +
+      ` ${signal.inRunning ? "[LIVE]" : "[pre]"}` +
+      ` stake=${(decision.stakeLamports / 1e9).toFixed(4)} SOL`
     );
 
     this.strategy.markPending(decision.key);
 
     this._executeDecision(decision).catch((err) => {
-      console.error(
-        `[Agent] Execution error for ${decision.key}: ${String(err)}`
-      );
+      console.error(`[Agent] Execution error for ${decision.key}: ${String(err)}`);
       this.strategy.markFailed(decision.key);
     });
   }
 
   private async _executeDecision(decision: TradeDecision): Promise<void> {
     console.log(
-      `[Agent] → Submitting Jito bundle | fixture=${decision.fixtureId} sel=${decision.selectionName}`
+      `[Agent] → Submitting bundle | fixture=${decision.fixtureId} sel=${decision.selectionName}`
     );
 
     const result = await this.jito.executeDecision(decision, this.anchor);
 
     if (result.status === "failed") {
-      console.error(
-        `[Agent] ✗ Bundle failed | ${decision.key} bundleId=${result.bundleId}`
-      );
+      console.error(`[Agent] ✗ Bundle failed | ${decision.key} bundleId=${result.bundleId}`);
       this.strategy.markFailed(decision.key);
       return;
     }
 
     const pdaAddress = this.anchor.derivePositionPDA(decision.fixtureId).toBase58();
-
     console.log(
       `[Agent] ✓ Position placed | fixture=${decision.fixtureId} sel=${decision.selectionName}` +
-        ` pda=${pdaAddress} bundleId=${result.bundleId} status=${result.status}`
+      ` pda=${pdaAddress} bundleId=${result.bundleId} status=${result.status}`
     );
 
     this.strategy.recordOpen(decision, pdaAddress);
     this.geyser.watchAccount(pdaAddress);
   }
 
-  // ── Geyser account update ─────────────────────────────────────────────────
+  // ── Geyser account update ──────────────────────────────────────────────────
 
   private _onAccountUpdate(update: AccountUpdate): void {
     if (!update.exists) {
       console.log(`[Agent] ⬡ Account closed | ${update.pubkey}`);
       return;
     }
-
-    const pos = this.strategy
-      .getOpenPositions()
-      .find((p) => p.pdaAddress === update.pubkey);
-
+    const pos = this.strategy.getOpenPositions().find((p) => p.pdaAddress === update.pubkey);
     if (!pos) return;
-
     console.log(
       `[Agent] ⬡ On-chain confirm | fixture=${pos.fixtureId} sel=${pos.selectionName}` +
-        ` slot=${update.slot} lamports=${update.lamports}`
+      ` slot=${update.slot} lamports=${update.lamports}`
     );
+  }
+
+  // ── Live settlement from scores ────────────────────────────────────────────
+
+  /**
+   * Called when game_finalised fires.  For each open position on this fixture
+   * determine the outcome from the final score and settle on-chain.
+   *
+   * Outcome logic:
+   *  - selection "home"  → won if score1 > score2, lost if score1 < score2, voided on draw
+   *  - selection "draw"  → won if score1 === score2
+   *  - selection "away"  → won if score2 > score1
+   *  - anything else     → voided (we can't determine outcome without market rules)
+   */
+  private async _settleFromScores(fixtureId: string): Promise<void> {
+    const open = this.strategy.getOpenPositions().filter((p) => p.fixtureId === fixtureId);
+    if (open.length === 0) return;
+
+    const finalScore = this.finalScores.get(fixtureId);
+
+    for (const pos of open) {
+      let outcome: "won" | "lost" | "voided" = "voided";
+
+      if (finalScore) {
+        const { score1, score2 } = finalScore;
+        const sel = pos.selectionName.toLowerCase();
+
+        if (sel === "home") {
+          outcome = score1 > score2 ? "won" : score1 < score2 ? "lost" : "voided";
+        } else if (sel === "draw") {
+          outcome = score1 === score2 ? "won" : "lost";
+        } else if (sel === "away") {
+          outcome = score2 > score1 ? "won" : score2 < score1 ? "lost" : "voided";
+        }
+        // All other selections (e.g. Asian handicap, over/under) → voided
+        // because outcome resolution requires market-specific rules.
+      }
+
+      await this._settlePosition(fixtureId, pos.selectionName, outcome);
+    }
   }
 
   // ── Periodic maintenance ──────────────────────────────────────────────────
 
   private _startPeriodicTasks(): void {
-    // Prune stale signal history every 30 seconds
     this.pruneTimer = setInterval(() => {
       this.signal.pruneHistory();
     }, 30_000);
 
-    // Settlement check every 60 seconds
+    // Fallback settlement — catches any fixture where game_finalised was
+    // missed or the scores stream was down.
     this.settlementTimer = setInterval(() => {
-      this._checkSettlements().catch((err) => {
-        console.error(`[Agent] Settlement check error: ${String(err)}`);
-      });
+      this._checkStaleSettlements().catch((err) =>
+        console.error(`[Agent] Settlement check error: ${String(err)}`)
+      );
     }, 60_000);
 
-    // Schedule token refresh before expiry (every REFRESH_INTERVAL_MS = 6 h)
     this._scheduleTokenRefresh();
   }
 
@@ -379,36 +442,45 @@ class OddsForgeAgent {
     this.tokenRefreshTimer = setTimeout(async () => {
       console.log("[Agent] Refreshing TxLINE API token …");
       try {
-        // Re-run the full activate flow rather than just token refresh,
-        // since the free subscription is valid for the full tournament.
-        this.credentials = await this.auth.activate();
+        if (this.credentials?.txSig) {
+          this.credentials = await this.auth.refreshToken(this.credentials.txSig);
+        } else {
+          this.credentials = await this.auth.activate();
+        }
         console.log("[Agent] TxLINE token refreshed");
       } catch (err) {
         console.error(`[Agent] Token refresh failed: ${String(err)}`);
       }
-      // Schedule the next refresh
       this._scheduleTokenRefresh();
     }, REFRESH_INTERVAL_MS);
   }
 
-  private async _checkSettlements(): Promise<void> {
-    const open = this.strategy.getOpenPositions();
+  /**
+   * Fallback: settle positions for fixtures that have been silent for > 2 hours.
+   * The primary settlement path is game_finalised from the scores stream.
+   */
+  private async _checkStaleSettlements(): Promise<void> {
+    const open  = this.strategy.getOpenPositions();
     if (open.length === 0) return;
 
-    const now = Date.now();
-    const STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
+    const now               = Date.now();
+    const STALE_MS          = 2 * 60 * 60 * 1000; // 2 hours
+    const seenFixtures      = new Set<string>();
 
     for (const pos of open) {
+      if (seenFixtures.has(pos.fixtureId)) continue;
+
       const lastSeen = this.lastSeenTs.get(pos.fixtureId);
       if (!lastSeen) continue;
 
-      const ageMs = now - lastSeen;
-      if (ageMs > STALE_THRESHOLD_MS) {
+      if (now - lastSeen > STALE_MS) {
+        seenFixtures.add(pos.fixtureId);
         console.log(
-          `[Agent] fixture=${pos.fixtureId} appears finished` +
-            ` (last odds update ${Math.round(ageMs / 60000)}m ago) — settling as voided`
+          `[Agent] fixture=${pos.fixtureId} stale (last odds ${Math.round((now - lastSeen) / 60000)}m ago)` +
+          ` — settling open positions as voided`
         );
-        await this._settlePosition(pos.fixtureId, pos.selectionName, "voided");
+        // Try to use cached final score first, otherwise void
+        await this._settleFromScores(pos.fixtureId);
       }
     }
   }
@@ -425,7 +497,6 @@ class OddsForgeAgent {
       );
       this.strategy.recordSettlement(fixtureId, selectionName, outcome);
 
-      // Reclaim rent
       try {
         const closeSig = await this.anchor.closePosition(fixtureId);
         console.log(`[Agent] ✓ Position closed (rent reclaimed) tx=${closeSig}`);
@@ -433,9 +504,7 @@ class OddsForgeAgent {
         console.warn(`[Agent] Could not close position: ${String(closeErr)}`);
       }
     } catch (err) {
-      console.error(
-        `[Agent] Settlement error for fixture=${fixtureId}: ${String(err)}`
-      );
+      console.error(`[Agent] Settlement error fixture=${fixtureId}: ${String(err)}`);
     }
   }
 }
@@ -446,7 +515,6 @@ class OddsForgeAgent {
 
 async function main(): Promise<void> {
   let cfg: ReturnType<typeof loadConfig>;
-
   try {
     cfg = loadConfig();
   } catch (err) {
@@ -462,9 +530,8 @@ async function main(): Promise<void> {
     process.exit(0);
   };
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGINT",  () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
-
   process.on("unhandledRejection", (reason) => {
     console.error("[Agent] Unhandled rejection:", reason);
   });

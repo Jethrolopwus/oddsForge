@@ -7,7 +7,7 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-oddsforge_executor = "7NeF1c8RMvLzM7qDgcroJ3PmmTbQpWCCaAw2dWHYfAwL"
+oddsforge_executor = "3XVn1g5q5NbGB7r3u8dYfWsmZw1n3bqCFXjiawvDSBBe"
 
 [registry]
 url = "https://api.apr.dev"

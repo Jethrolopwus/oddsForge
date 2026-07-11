@@ -57,6 +57,8 @@ export interface TxLineAuthConfig {
 export interface TxLineCredentials {
   jwt: string;
   apiToken: string;
+  /** On-chain subscribe transaction signature — reuse for token refresh */
+  txSig: string;
   /** Millisecond timestamp when these credentials were activated */
   activatedAt: number;
 }
@@ -179,7 +181,7 @@ export class TxLineAuth {
     const apiToken = await this._activateToken(jwt, txSig);
     console.log("[TxLINE Auth] API token activated");
 
-    return { jwt, apiToken, activatedAt: Date.now() };
+    return { jwt, apiToken, txSig, activatedAt: Date.now() };
   }
 
   /**
@@ -192,7 +194,7 @@ export class TxLineAuth {
     const jwt = await this._getGuestJwt();
     const apiToken = await this._activateToken(jwt, existingTxSig);
     console.log("[TxLINE Auth] Token refreshed");
-    return { jwt, apiToken, activatedAt: Date.now() };
+    return { jwt, apiToken, txSig: existingTxSig, activatedAt: Date.now() };
   }
 
   /** Returns the configured API origin (e.g. https://txline.txodds.com) */

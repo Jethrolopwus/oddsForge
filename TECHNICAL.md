@@ -38,7 +38,7 @@ OddsForge is a **fully autonomous on-chain trading agent** built on Solana. It i
 | **Data source** | TxLINE SSE stream (`/api/odds/stream`) |
 | **Data feed type** | Server-Sent Events (real-time, free tier) |
 | **Chain** | Solana Mainnet / Devnet |
-| **Smart contract** | Anchor 0.31.1, Program ID `7NeF1c8RMvLzM7qDgcroJ3PmmTbQpWCCaAw2dWHYfAwL` |
+| **Smart contract** | Anchor 0.31.1, Program ID `3XVn1g5q5NbGB7r3u8dYfWsmZw1n3bqCFXjiawvDSBBe` (devnet) |
 | **Execution** | Jito MEV bundles |
 | **State confirmation** | Yellowstone gRPC (Triton One) |
 | **Signal threshold** | ≥ 5% odds movement in 60 seconds, score ≥ 60/100 |

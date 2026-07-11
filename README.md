@@ -29,8 +29,7 @@ transactions — all without any manual input.
 
 ## Features
 
-- **Real-time odds ingestion** — Connects to TxODDS WebSocket for live match
-  odds and scores across all World Cup games.
+- **Real-time odds ingestion** — Connects to the [TxLINE World Cup free tier](https://txline.txodds.com/documentation/worldcup) via SSE for live odds and scores across World Cup and International Friendlies matches.
 
 - **Autonomous signal detection** — Proprietary engine detects odds movements
   ≥5% within a 60-second window and scores each signal 0–100 for confidence
@@ -56,7 +55,7 @@ transactions — all without any manual input.
 ┌─────────────────────────────────────────────────────────────┐
 │                    ODDSFORGE AGENT                          │
 │                                                             │
-│  TxODDS WebSocket ──► Signal Engine ──► Score ≥ 60?        │
+│  TxLINE SSE (odds + scores) ──► Signal Engine ──► Score ≥ 60?        │
 │                                              │              │
 │                                              ▼              │
 │                                     Jito Bundle Builder     │
@@ -101,7 +100,8 @@ score = 100 →  MAX_STAKE_LAMPORTS  (0.10 SOL)
 | Solana Client | `@solana/web3.js` 1.98 |
 | MEV Execution | Jito Block Engine REST API |
 | Account Streaming | Yellowstone gRPC (`@triton-one/yellowstone-grpc`) |
-| Odds Feed | TxODDS WebSocket API |
+| Odds Feed | TxLINE SSE API (`/api/odds/stream`, `/api/scores/stream`) |
+| Auth | TxLINE guest JWT + on-chain subscribe + API token activation |
 | Wallet | `@coral-xyz/anchor` NodeWallet |
 
 ---
@@ -115,8 +115,13 @@ oddsforge/
 │   │   ├── src/
 │   │   │   ├── index.ts              # Entry point & agent loop
 │   │   │   ├── feeds/
-│   │   │   │   ├── txodds.ts         # TxODDS WebSocket connector
+│   │   │   │   ├── txline-auth.ts    # TxLINE auth + on-chain subscribe
+│   │   │   │   ├── txline.ts         # TxLINE odds SSE connector
+│   │   │   │   ├── txline-scores.ts  # TxLINE scores SSE connector
+│   │   │   │   ├── txline-query.ts   # TxLINE HTTP query client
 │   │   │   │   └── geyser.ts         # Yellowstone gRPC listener
+│   │   │   ├── scripts/
+│   │   │   │   └── query.ts          # Standalone TxLINE query CLI
 │   │   │   ├── engine/
 │   │   │   │   ├── signal.ts         # Odds signal detection
 │   │   │   │   └── strategy.ts       # Decision engine
@@ -144,8 +149,8 @@ oddsforge/
 - Rust 1.85+ (`rustup update stable`)
 - Solana CLI 1.18+ (`sh -c "$(curl -sSfL https://release.solana.com/stable/install)"`)
 - Anchor CLI 0.31.1 (`avm install 0.31.1 && avm use 0.31.1`)
-- TxODDS API key
-- Triton One Geyser endpoint + token
+- Solana wallet funded with devnet SOL (for TxLINE subscribe tx fees + position rent)
+- Triton One Geyser endpoint + token (optional — agent works without it)
 
 ### Installation
 
@@ -173,14 +178,15 @@ Required variables:
 
 | Variable | Description |
 |---|---|
-| `SOLANA_RPC_URL` | Solana RPC endpoint |
+| `SOLANA_RPC_URL` | Solana RPC endpoint (must match `TXLINE_NETWORK`) |
 | `SOLANA_PRIVATE_KEY` | Agent wallet (JSON array or base58) |
-| `PROGRAM_ID` | Deployed program ID |
-| `TXODDS_API_KEY` | TxODDS API key |
-| `TXODDS_WS_URL` | TxODDS WebSocket URL |
-| `GEYSER_ENDPOINT` | Triton One gRPC endpoint |
-| `GEYSER_TOKEN` | Triton One access token |
-| `JITO_BLOCK_ENGINE_URL` | Jito Block Engine URL |
+| `PROGRAM_ID` | Deployed oddsforge-executor program ID |
+| `TXLINE_NETWORK` | `devnet` or `mainnet` (default: `devnet` in `.env.example`) |
+| `TXLINE_SERVICE_LEVEL_ID` | `1` = 60s delay (free), `12` = real-time (free on mainnet) |
+| `TXLINE_DURATION_WEEKS` | Subscription duration in weeks (minimum 4) |
+| `GEYSER_ENDPOINT` | Triton One gRPC endpoint (optional) |
+| `GEYSER_TOKEN` | Triton One access token (optional) |
+| `JITO_BLOCK_ENGINE_URL` | Jito Block Engine URL (optional) |
 
 Optional tuning variables:
 
@@ -204,21 +210,27 @@ anchor deploy
 cd ../../agent
 npm run build
 npm run start
+
+# Or test TxLINE feeds only (no trading):
+npm run query fixtures
+npm run query stream odds
 ```
 
 The agent will:
-1. Connect to TxODDS and start streaming live odds
-2. Detect value signals and score them
-3. Submit Jito bundles for qualifying signals
-4. Watch position PDAs via Geyser for on-chain confirmation
-5. Periodically check for settled matches and close positions
+1. Bootstrap TxLINE auth (guest JWT → on-chain subscribe → API token activation)
+2. Connect to TxLINE odds and scores SSE streams
+3. Detect value signals and score them
+4. Submit Jito bundles (or plain RPC) for qualifying signals
+5. Settle positions on `game_finalised` score events
+6. Optionally watch position PDAs via Geyser for on-chain confirmation
 
 ---
 
 ## How It Works
 
-1. The agent connects to the **TxODDS WebSocket** and streams live odds for all
-   active World Cup matches.
+1. On startup, **TxLineAuth** runs the [TxLINE World Cup free tier](https://txline.txodds.com/documentation/worldcup) flow: guest JWT, on-chain `subscribe()` on the TxOracle program, then wallet-signed API token activation. No manual API key is required.
+
+2. The agent connects to **TxLINE SSE streams** (`/api/odds/stream` and `/api/scores/stream`) for live World Cup and International Friendlies data.
 
 2. The **Signal Engine** tracks odds history per match. When it detects a
    movement ≥5% within a 60-second window, it calculates a signal score (0–100)
@@ -232,8 +244,8 @@ The agent will:
 4. The **Yellowstone Geyser** monitor watches the position PDA account for state
    changes and confirms when the transaction is finalized on-chain.
 
-5. After the match concludes, the `settle_position` instruction marks the
-   position as Won, Lost, or Voided based on the final TxODDS score data.
+5. When a match ends, the scores stream emits `game_finalised` (statusId=100).
+   The agent resolves 1X2 outcomes from the final score and calls `settle_position`.
 
 6. The `close_position` instruction reclaims the rent lamports from the settled
    position account.
@@ -288,7 +300,8 @@ Tests cover all instructions and error paths:
 
 ## Key Resources
 
-- [TxODDS API Docs](https://txodds.com/docs)
+- [TxLINE World Cup Free Tier](https://txline.txodds.com/documentation/worldcup)
+- [TxLINE Documentation](https://txline.txodds.com/documentation)
 - [Jito Block Engine Docs](https://jito-labs.gitbook.io/mev)
 - [Yellowstone gRPC Docs](https://docs.triton.one/project-yellowstone/whats-yellowstone)
 - [Anchor Framework](https://www.anchor-lang.com/)
